@@ -479,13 +479,20 @@ func runMCPHost(ctx context.Context) error {
 		log.SetReportCaller(false)
 	}
 
-	systemPrompt, err := loadSystemPrompt(systemPromptFile)
-	if err != nil {
-		return fmt.Errorf("error loading system prompt: %v", err)
-	}
+	ms, err := NewSession(ctx, InitConfig{
+		ConfigFile:       configFile,
+		SystemPromptFile: systemPromptFile,
+		ModelFlag:        modelFlag,
+	})
+	defer ms.Close()
+
+	// err = ms.LoadSystemPrompt(ms.SystemPromptFile)
+	// if err != nil {
+	// 	return fmt.Errorf("error loading system prompt: %v", err)
+	// }
 
 	// Create the provider based on the model flag
-	provider, err := createProvider(ctx, modelFlag, systemPrompt)
+	err = ms.CreateProvider(ctx)
 	if err != nil {
 		return fmt.Errorf("error creating provider: %v", err)
 	}
@@ -493,7 +500,7 @@ func runMCPHost(ctx context.Context) error {
 	// Split the model flag and get just the model name
 	parts := strings.SplitN(modelFlag, ":", 2)
 	log.Info("Model loaded",
-		"provider", provider.Name(),
+		"provider", ms.Provider.Name(),
 		"model", parts[1])
 
 	mcpConfig, err := loadMCPConfig()
@@ -596,7 +603,7 @@ func runMCPHost(ctx context.Context) error {
 		if len(messages) > 0 {
 			messages = pruneMessages(messages)
 		}
-		err = runPrompt(ctx, provider, mcpClients, allTools, prompt, &messages)
+		err = runPrompt(ctx, ms.Provider, mcpClients, allTools, prompt, &messages)
 		if err != nil {
 			return err
 		}
