@@ -15,8 +15,6 @@ import (
 	"github.com/charmbracelet/log"
 
 	"github.com/charmbracelet/glamour"
-	mcpclient "github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcphost/pkg/history"
 	"github.com/mark3labs/mcphost/pkg/llm"
 	"github.com/mark3labs/mcphost/pkg/llm/anthropic"
@@ -237,237 +235,6 @@ func updateRenderer() error {
 	return err
 }
 
-// Method implementations for simpleMessage
-func runPrompt(
-	ctx context.Context,
-	provider llm.Provider,
-	mcpClients map[string]mcpclient.MCPClient,
-	tools []llm.Tool,
-	prompt string,
-	messages *[]history.HistoryMessage,
-) error {
-	// Display the user's prompt if it's not empty (i.e., not a tool response)
-	if prompt != "" {
-		fmt.Printf("\n%s\n", promptStyle.Render("You: "+prompt))
-		*messages = append(
-			*messages,
-			history.HistoryMessage{
-				Role: "user",
-				Content: []history.ContentBlock{{
-					Type: "text",
-					Text: prompt,
-				}},
-			},
-		)
-	}
-
-	var message llm.Message
-	var err error
-	backoff := initialBackoff
-	retries := 0
-
-	// Convert MessageParam to llm.Message for provider
-	// Messages already implement llm.Message interface
-	llmMessages := make([]llm.Message, len(*messages))
-	for i := range *messages {
-		llmMessages[i] = &(*messages)[i]
-	}
-
-	for {
-		action := func() {
-			message, err = provider.CreateMessage(
-				ctx,
-				prompt,
-				llmMessages,
-				tools,
-			)
-		}
-		_ = spinner.New().Title("Thinking...").Action(action).Run()
-
-		if err != nil {
-			// Check if it's an overloaded error
-			if strings.Contains(err.Error(), "overloaded_error") {
-				if retries >= maxRetries {
-					return fmt.Errorf(
-						"claude is currently overloaded. please wait a few minutes and try again",
-					)
-				}
-
-				log.Warn("Claude is overloaded, backing off...",
-					"attempt", retries+1,
-					"backoff", backoff.String())
-
-				time.Sleep(backoff)
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				retries++
-				continue
-			}
-			// If it's not an overloaded error, return the error immediately
-			return err
-		}
-		// If we got here, the request succeeded
-		break
-	}
-
-	var messageContent []history.ContentBlock
-
-	// Handle the message response
-	if str, err := renderer.Render("\nAssistant: "); message.GetContent() != "" && err == nil {
-		fmt.Print(str)
-	}
-
-	toolResults := []history.ContentBlock{}
-	messageContent = []history.ContentBlock{}
-
-	// Add text content
-	if message.GetContent() != "" {
-		if err := updateRenderer(); err != nil {
-			return fmt.Errorf("error updating renderer: %v", err)
-		}
-		str, err := renderer.Render(message.GetContent() + "\n")
-		if err != nil {
-			log.Error("Failed to render response", "error", err)
-			fmt.Print(message.GetContent() + "\n")
-		} else {
-			fmt.Print(str)
-		}
-		messageContent = append(messageContent, history.ContentBlock{
-			Type: "text",
-			Text: message.GetContent(),
-		})
-	}
-
-	// Handle tool calls
-	for _, toolCall := range message.GetToolCalls() {
-		log.Info("🔧 Using tool", "name", toolCall.GetName())
-
-		input, _ := json.Marshal(toolCall.GetArguments())
-		messageContent = append(messageContent, history.ContentBlock{
-			Type:  "tool_use",
-			ID:    toolCall.GetID(),
-			Name:  toolCall.GetName(),
-			Input: input,
-		})
-
-		// Log usage statistics if available
-		inputTokens, outputTokens := message.GetUsage()
-		if inputTokens > 0 || outputTokens > 0 {
-			log.Info("Usage statistics",
-				"input_tokens", inputTokens,
-				"output_tokens", outputTokens,
-				"total_tokens", inputTokens+outputTokens)
-		}
-
-		parts := strings.Split(toolCall.GetName(), "__")
-		if len(parts) != 2 {
-			fmt.Printf(
-				"Error: Invalid tool name format: %s\n",
-				toolCall.GetName(),
-			)
-			continue
-		}
-
-		serverName, toolName := parts[0], parts[1]
-		mcpClient, ok := mcpClients[serverName]
-		if !ok {
-			fmt.Printf("Error: Server not found: %s\n", serverName)
-			continue
-		}
-
-		var toolArgs map[string]interface{}
-		if err := json.Unmarshal(input, &toolArgs); err != nil {
-			fmt.Printf("Error parsing tool arguments: %v\n", err)
-			continue
-		}
-
-		var toolResultPtr *mcp.CallToolResult
-		action := func() {
-			req := mcp.CallToolRequest{}
-			req.Params.Name = toolName
-			req.Params.Arguments = toolArgs
-			toolResultPtr, err = mcpClient.CallTool(
-				context.Background(),
-				req,
-			)
-		}
-		_ = spinner.New().
-			Title(fmt.Sprintf("Running tool %s...", toolName)).
-			Action(action).
-			Run()
-
-		if err != nil {
-			errMsg := fmt.Sprintf(
-				"Error calling tool %s: %v",
-				toolName,
-				err,
-			)
-			fmt.Printf("\n%s\n", errorStyle.Render(errMsg))
-
-			// Add error message as tool result
-			toolResults = append(toolResults, history.ContentBlock{
-				Type:      "tool_result",
-				ToolUseID: toolCall.GetID(),
-				Content: []history.ContentBlock{{
-					Type: "text",
-					Text: errMsg,
-				}},
-			})
-			continue
-		}
-
-		toolResult := *toolResultPtr
-
-		if toolResult.Content != nil {
-			log.Debug("raw tool result content", "content", toolResult.Content)
-
-			// Create the tool result block
-			resultBlock := history.ContentBlock{
-				Type:      "tool_result",
-				ToolUseID: toolCall.GetID(),
-				Content:   toolResult.Content,
-			}
-
-			// Extract text content
-			var resultText string
-			// Handle array content directly since we know it's []interface{}
-			for _, item := range toolResult.Content {
-				if contentMap, ok := item.(mcp.TextContent); ok {
-					resultText += fmt.Sprintf("%v ", contentMap.Text)
-				}
-			}
-
-			resultBlock.Text = strings.TrimSpace(resultText)
-			log.Debug("created tool result block",
-				"block", resultBlock,
-				"tool_id", toolCall.GetID())
-
-			toolResults = append(toolResults, resultBlock)
-		}
-	}
-
-	*messages = append(*messages, history.HistoryMessage{
-		Role:    message.GetRole(),
-		Content: messageContent,
-	})
-
-	if len(toolResults) > 0 {
-		for _, toolResult := range toolResults {
-			*messages = append(*messages, history.HistoryMessage{
-				Role:    "tool",
-				Content: []history.ContentBlock{toolResult},
-			})
-		}
-		// Make another call to get Claude's response to the tool results
-		return runPrompt(ctx, provider, mcpClients, tools, "", messages)
-	}
-
-	fmt.Println() // Add spacing
-	return nil
-}
-
 func runMCPHost(ctx context.Context) error {
 	// Set up logging based on debug flag
 	if debugMode {
@@ -484,6 +251,9 @@ func runMCPHost(ctx context.Context) error {
 		SystemPromptFile: systemPromptFile,
 		ModelFlag:        modelFlag,
 	})
+	if err != nil {
+		return fmt.Errorf("error initializing session: %v", err)
+	}
 	defer ms.Close()
 
 	// err = ms.LoadSystemPrompt(ms.SystemPromptFile)
@@ -495,65 +265,6 @@ func runMCPHost(ctx context.Context) error {
 	err = ms.CreateProvider(ctx)
 	if err != nil {
 		return fmt.Errorf("error creating provider: %v", err)
-	}
-
-	// Split the model flag and get just the model name
-	parts := strings.SplitN(modelFlag, ":", 2)
-	log.Info("Model loaded",
-		"provider", ms.Provider.Name(),
-		"model", parts[1])
-
-	mcpConfig, err := loadMCPConfig()
-	if err != nil {
-		return fmt.Errorf("error loading MCP config: %v", err)
-	}
-
-	mcpClients, err := createMCPClients(mcpConfig)
-	if err != nil {
-		return fmt.Errorf("error creating MCP clients: %v", err)
-	}
-
-	defer func() {
-		log.Info("Shutting down MCP servers...")
-		for name, client := range mcpClients {
-			if err := client.Close(); err != nil {
-				log.Error("Failed to close server", "name", name, "error", err)
-			} else {
-				log.Info("Server closed", "name", name)
-			}
-		}
-	}()
-
-	for name := range mcpClients {
-		log.Info("Server connected", "name", name)
-	}
-
-	var allTools []llm.Tool
-	for serverName, mcpClient := range mcpClients {
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		toolsResult, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
-		cancel()
-
-		if err != nil {
-			log.Error(
-				"Error fetching tools",
-				"server",
-				serverName,
-				"error",
-				err,
-			)
-			continue
-		}
-
-		serverTools := mcpToolsToAnthropicTools(serverName, toolsResult.Tools)
-		allTools = append(allTools, serverTools...)
-		log.Info(
-			"Tools loaded",
-			"server",
-			serverName,
-			"count",
-			len(toolsResult.Tools),
-		)
 	}
 
 	if err := updateRenderer(); err != nil {
@@ -589,8 +300,8 @@ func runMCPHost(ctx context.Context) error {
 		// Handle slash commands
 		handled, err := handleSlashCommand(
 			prompt,
-			mcpConfig,
-			mcpClients,
+			ms.Config,
+			ms.MCPClients,
 			messages,
 		)
 		if err != nil {
@@ -603,7 +314,61 @@ func runMCPHost(ctx context.Context) error {
 		if len(messages) > 0 {
 			messages = pruneMessages(messages)
 		}
-		err = runPrompt(ctx, ms.Provider, mcpClients, allTools, prompt, &messages)
+
+		callback := func(
+			ctx context.Context,
+			text string,
+			mode int,
+			action func(),
+		) error {
+			switch mode {
+			case MODE_USER_PROMPT:
+				if text == "" {
+					return nil // Skip empty user messages
+				}
+				fmt.Printf("\n%s\n", promptStyle.Render("You: "+text))
+			case MODE_CREATE_MESSAGE:
+				if action != nil {
+					// If an action is provided, run it
+					err = spinner.New().Title("Thinking...").Action(action).Run()
+				}
+			case MODE_ASSISTANT_MESSAGE:
+				// Handle the message response
+				if str, err := renderer.Render("\nAssistant: "); text != "" && err == nil {
+					fmt.Print(str)
+				}
+				if err := updateRenderer(); err != nil {
+					return fmt.Errorf("error updating renderer: %v", err)
+				}
+				str, err := renderer.Render(text + "\n")
+				if err != nil {
+					log.Error("Failed to render response", "error", err)
+					fmt.Print(text + "\n")
+				} else {
+					fmt.Print(str)
+				}
+			case MODE_RUN_TOOL:
+				if text == "" {
+					return nil // Skip empty tool messages
+				}
+				_ = spinner.New().
+					Title(fmt.Sprintf("Running tool %s...", text)).
+					Action(action).
+					Run()
+			case MODE_ERROR:
+				fmt.Printf("\n%s\n", errorStyle.Render(text))
+
+			default:
+				if action != nil {
+					// If an action is provided, run it
+					action()
+				}
+				return nil
+			}
+			return nil
+		}
+		err = ms.RunPrompt(ctx, prompt, &messages, callback)
+		fmt.Println() // Add spacing
 		if err != nil {
 			return err
 		}

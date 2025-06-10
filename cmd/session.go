@@ -10,7 +10,6 @@ import (
 
 	"path/filepath"
 
-	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/log"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
@@ -49,6 +48,15 @@ type InitConfig struct {
 	ConfigFile       string `json:"configFile"`
 	InTerminal       bool   `json:"inTerminal"`
 }
+
+// Callback enums for message roles
+const (
+	MODE_USER_PROMPT = iota
+	MODE_CREATE_MESSAGE
+	MODE_ASSISTANT_MESSAGE
+	MODE_RUN_TOOL
+	MODE_ERROR
+)
 
 func (ms *MCPSession) LoadMCPConfig(configPath string) error {
 	if configPath == "" {
@@ -135,7 +143,33 @@ func (ms *MCPSession) LoadSystemPrompt(filePath string) error {
 	return nil
 }
 
-func (ms *MCPSession) CreateMessage(ctx context.Context, prompt string, messages *[]history.HistoryMessage) (llm.Message, error) {
+// Method implementations for simpleMessage
+func (ms *MCPSession) RunPrompt(
+	ctx context.Context,
+	prompt string,
+	messages *[]history.HistoryMessage,
+	callback func(
+		ctx context.Context,
+		text string,
+		role int,
+		action func(),
+	) error,
+) error {
+	// Display the user's prompt if it's not empty (i.e., not a tool response)
+	if prompt != "" {
+		callback(ctx, prompt, MODE_USER_PROMPT, nil)
+		*messages = append(
+			*messages,
+			history.HistoryMessage{
+				Role: "user",
+				Content: []history.ContentBlock{{
+					Type: "text",
+					Text: prompt,
+				}},
+			},
+		)
+	}
+
 	var message llm.Message
 	var err error
 	backoff := initialBackoff
@@ -157,19 +191,13 @@ func (ms *MCPSession) CreateMessage(ctx context.Context, prompt string, messages
 				ms.AllTools,
 			)
 		}
-		if ms.InTerminal {
-			// If we're in a terminal, use a spinner to indicate processing
-			_ = spinner.New().Title("Thinking...").Action(action).Run()
-		} else {
-			// If we're not in a terminal, just run the action directly
-			action()
-		}
+		callback(ctx, "", MODE_CREATE_MESSAGE, action)
 
 		if err != nil {
 			// Check if it's an overloaded error
 			if strings.Contains(err.Error(), "overloaded_error") {
 				if retries >= maxRetries {
-					return nil, fmt.Errorf(
+					return fmt.Errorf(
 						"claude is currently overloaded. please wait a few minutes and try again",
 					)
 				}
@@ -187,12 +215,152 @@ func (ms *MCPSession) CreateMessage(ctx context.Context, prompt string, messages
 				continue
 			}
 			// If it's not an overloaded error, return the error immediately
-			return nil, err
+			return err
 		}
 		// If we got here, the request succeeded
 		break
 	}
-	return message, nil
+
+	var messageContent []history.ContentBlock
+
+	toolResults := []history.ContentBlock{}
+	messageContent = []history.ContentBlock{}
+
+	// Call the callback function with the message
+	callback(ctx, message.GetContent(), MODE_ASSISTANT_MESSAGE, nil)
+
+	// Add text content
+	if message.GetContent() != "" {
+		messageContent = append(messageContent, history.ContentBlock{
+			Type: "text",
+			Text: message.GetContent(),
+		})
+	}
+
+	// Handle tool calls
+	for _, toolCall := range message.GetToolCalls() {
+		log.Info("🔧 Using tool", "name", toolCall.GetName())
+
+		input, _ := json.Marshal(toolCall.GetArguments())
+		messageContent = append(messageContent, history.ContentBlock{
+			Type:  "tool_use",
+			ID:    toolCall.GetID(),
+			Name:  toolCall.GetName(),
+			Input: input,
+		})
+
+		// Log usage statistics if available
+		inputTokens, outputTokens := message.GetUsage()
+		if inputTokens > 0 || outputTokens > 0 {
+			log.Info("Usage statistics",
+				"input_tokens", inputTokens,
+				"output_tokens", outputTokens,
+				"total_tokens", inputTokens+outputTokens)
+		}
+
+		parts := strings.Split(toolCall.GetName(), "__")
+		if len(parts) != 2 {
+			fmt.Printf(
+				"Error: Invalid tool name format: %s\n",
+				toolCall.GetName(),
+			)
+			continue
+		}
+
+		serverName, toolName := parts[0], parts[1]
+		mcpClient, ok := ms.MCPClients[serverName]
+		if !ok {
+			fmt.Printf("Error: Server not found: %s\n", serverName)
+			continue
+		}
+
+		var toolArgs map[string]interface{}
+		if err := json.Unmarshal(input, &toolArgs); err != nil {
+			fmt.Printf("Error parsing tool arguments: %v\n", err)
+			continue
+		}
+
+		var toolResultPtr *mcp.CallToolResult
+		action := func() {
+			req := mcp.CallToolRequest{}
+			req.Params.Name = toolName
+			req.Params.Arguments = toolArgs
+			toolResultPtr, err = mcpClient.CallTool(
+				context.Background(),
+				req,
+			)
+		}
+		callback(ctx, toolName, MODE_RUN_TOOL, action)
+
+		if err != nil {
+			errMsg := fmt.Sprintf(
+				"Error calling tool %s: %v",
+				toolName,
+				err,
+			)
+
+			callback(ctx, errMsg, MODE_ERROR, nil)
+
+			// Add error message as tool result
+			toolResults = append(toolResults, history.ContentBlock{
+				Type:      "tool_result",
+				ToolUseID: toolCall.GetID(),
+				Content: []history.ContentBlock{{
+					Type: "text",
+					Text: errMsg,
+				}},
+			})
+			continue
+		}
+
+		toolResult := *toolResultPtr
+
+		if toolResult.Content != nil {
+			log.Debug("raw tool result content", "content", toolResult.Content)
+
+			// Create the tool result block
+			resultBlock := history.ContentBlock{
+				Type:      "tool_result",
+				ToolUseID: toolCall.GetID(),
+				Content:   toolResult.Content,
+			}
+
+			// Extract text content
+			var resultText string
+			// Handle array content directly since we know it's []interface{}
+			for _, item := range toolResult.Content {
+				if contentMap, ok := item.(mcp.TextContent); ok {
+					resultText += fmt.Sprintf("%v ", contentMap.Text)
+				}
+			}
+
+			resultBlock.Text = strings.TrimSpace(resultText)
+			log.Debug("created tool result block",
+				"block", resultBlock,
+				"tool_id", toolCall.GetID())
+
+			toolResults = append(toolResults, resultBlock)
+		}
+	}
+
+	*messages = append(*messages, history.HistoryMessage{
+		Role:    message.GetRole(),
+		Content: messageContent,
+	})
+
+	if len(toolResults) > 0 {
+		for _, toolResult := range toolResults {
+			*messages = append(*messages, history.HistoryMessage{
+				Role:    "tool",
+				Content: []history.ContentBlock{toolResult},
+			})
+		}
+		// Make another call to get Claude's response to the tool results
+		return ms.RunPrompt(ctx, "", messages, callback)
+	}
+
+	// fmt.Println() // Add spacing
+	return nil
 }
 
 func NewSession(ctx context.Context, cfg InitConfig) (*MCPSession, error) {
